@@ -98,34 +98,109 @@ def extract_keywords(description: str) -> dict:
 
 
 # ---------------- 步骤 2：GitHub 搜索 ----------------
+# def search_repos(keywords, language, min_stars, per_page=50) -> list[dict]:
+#     q_parts = [" ".join(keywords)]
+#     if language:
+#         q_parts.append(f"language:{language}")
+#     if min_stars:
+#         q_parts.append(f"stars:>={min_stars}")
+#     query = " ".join(q_parts)
+
+#     print(f"[search] q = {query!r}")
+
+#     r = requests.get(
+#         "https://api.github.com/search/repositories",
+#         headers=GH_HEADERS,
+#         params={"q": query, "per_page": per_page, "sort": "stars"},
+#         timeout=30,
+#     )
+#     if r.status_code == 422:
+#         print(f"[warn] 查询语法非法，回退到纯关键词", file=sys.stderr)
+#         r = requests.get(
+#             "https://api.github.com/search/repositories",
+#             headers=GH_HEADERS,
+#             params={"q": " ".join(keywords), "per_page": per_page, "sort": "stars"},
+#             timeout=30,
+#         )
+#     r.raise_for_status()
+#     return r.json().get("items", [])
+
 def search_repos(keywords, language, min_stars, per_page=50) -> list[dict]:
+    """
+    构造 GitHub 搜索查询并调用 API。
+    多语言用空格分隔（language:verilog language:systemverilog），
+    而不是逗号（language:verilog,systemverilog 是无效语法）。
+    """
     q_parts = [" ".join(keywords)]
+
+    # 多语言支持：按空格或逗号拆分，逐个添加 language: 限定符
     if language:
-        q_parts.append(f"language:{language}")
+        langs = re.split(r"[\s,]+", language.strip())
+        for lang in langs:
+            if lang:
+                q_parts.append(f"language:{lang}")
+
     if min_stars:
         q_parts.append(f"stars:>={min_stars}")
+
     query = " ".join(q_parts)
 
-    print(f"[search] q = {query!r}")
+    # ============ 日志：打印完整查询 ============
+    print("=" * 60)
+    print(f"[search] 关键词        : {keywords}")
+    print(f"[search] 语言限定      : {language!r}")
+    print(f"[search] 最低 Star     : {min_stars!r}")
+    print(f"[search] 最终查询字符串: {query!r}")
+    print(f"[search] 请求 URL      : https://api.github.com/search/repositories")
+    print(f"[search] 请求参数      : q={query!r}, per_page={per_page}, sort=stars")
+    print("=" * 60)
+    # ============================================
 
-    r = requests.get(
-        "https://api.github.com/search/repositories",
-        headers=GH_HEADERS,
-        params={"q": query, "per_page": per_page, "sort": "stars"},
-        timeout=30,
-    )
-    if r.status_code == 422:
-        print(f"[warn] 查询语法非法，回退到纯关键词", file=sys.stderr)
-        r = requests.get(
+    def _do_search(q: str) -> requests.Response:
+        return requests.get(
             "https://api.github.com/search/repositories",
             headers=GH_HEADERS,
-            params={"q": " ".join(keywords), "per_page": per_page, "sort": "stars"},
+            params={"q": q, "per_page": per_page, "sort": "stars"},
             timeout=30,
         )
+
+    r = _do_search(query)
+
+    # 打印响应状态和速率限制
+    print(f"[search] 响应状态码    : {r.status_code}")
+    print(f"[search] 速率限制剩余  : {r.headers.get('X-RateLimit-Remaining')}"
+          f" / {r.headers.get('X-RateLimit-Limit')}")
+    print(f"[search] 速率重置时间  : {r.headers.get('X-RateLimit-Reset')}")
+
+    # 422：语法非法，回退到纯关键词
+    if r.status_code == 422:
+        print(f"[warn] 422 查询语法非法，响应内容: {r.text[:500]}", file=sys.stderr)
+        fallback_q = " ".join(keywords)
+        print(f"[warn] 回退查询字符串: {fallback_q!r}", file=sys.stderr)
+        r = _do_search(fallback_q)
+
+    # 403 / 429：速率限制
+    if r.status_code in (403, 429):
+        print(f"[warn] {r.status_code} 可能触发速率限制，响应内容: {r.text[:500]}",
+              file=sys.stderr)
+
     r.raise_for_status()
-    return r.json().get("items", [])
 
+    data = r.json()
+    items = data.get("items", [])
 
+    # 打印结果数量和总数
+    print(f"[search] 本次返回数量  : {len(items)}")
+    print(f"[search] GitHub 报告总数: {data.get('total_count', 'N/A')}")
+    if data.get("incomplete_results"):
+        print(f"[warn] GitHub 报告结果不完整 (incomplete_results=true)", file=sys.stderr)
+
+    # 如果返回 0 条，打印前几个字段帮助排查
+    if not items:
+        print(f"[warn] 查询返回 0 条结果，请检查关键词和限定条件是否过严",
+              file=sys.stderr)
+
+    return items
 # ---------------- 步骤 3：获取 README ----------------
 def fetch_readme(full_name: str, max_chars: int = 3500) -> str:
     url = f"https://api.github.com/repos/{full_name}/readme"
