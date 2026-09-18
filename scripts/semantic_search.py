@@ -54,6 +54,15 @@ def llm_chat(system: str, user: str, temperature: float = 0.2) -> str:
         r = requests.post(url, headers=headers, json=payload, timeout=90)
         if r.status_code == 200:
             return r.json()["choices"][0]["message"]["content"]
+        
+        # ============ 新增：打印详细错误 ============
+        print(f"[llm] 状态码: {r.status_code}", file=sys.stderr)
+        print(f"[llm] 响应头 X-RateLimit: "
+              f"{r.headers.get('X-RateLimit-Remaining')} / "
+              f"{r.headers.get('X-RateLimit-Limit')}", file=sys.stderr)
+        print(f"[llm] 响应正文: {r.text[:800]}", file=sys.stderr)
+        # ==========================================
+        
         if r.status_code in (429, 500, 502, 503):
             wait = 5 * (attempt + 1)
             print(f"[warn] LLM {r.status_code}, 等待 {wait}s 重试...", file=sys.stderr)
