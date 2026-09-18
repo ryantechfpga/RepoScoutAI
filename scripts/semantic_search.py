@@ -62,7 +62,7 @@ def llm_chat(system: str, user: str, temperature: float = 0.2) -> str:
               f"{r.headers.get('X-RateLimit-Limit')}", file=sys.stderr)
         print(f"[llm] 响应正文: {r.text[:800]}", file=sys.stderr)
         # ==========================================
-        
+
         if r.status_code in (429, 500, 502, 503):
             wait = 5 * (attempt + 1)
             print(f"[warn] LLM {r.status_code}, 等待 {wait}s 重试...", file=sys.stderr)
@@ -89,127 +89,145 @@ def llm_json(system: str, user: str):
 def extract_keywords(description: str) -> dict:
     system = (
         "你是一个开源项目检索助手。用户会用自然语言描述他想找的开源项目。\n"
-        "请完成两件事：\n"
-        "1) 提取 3-6 个最适合用于 GitHub 仓库搜索的英文关键词/短语（技术栈、功能、领域）\n"
-        "2) 用一句话总结用户的核心需求\n"
-        "返回严格的 JSON，格式如下，不要任何额外文字：\n"
-        '{"keywords": ["vector database", "embedding", "python"], '
-        '"summary": "用户想找一个轻量级、支持中文的向量数据库"}'
+        "请完成三件事：\n"
+        "1) 提取 4-6 个英文关键词，并给每个词标注优先级\n"
+        "   优先级用 1、2、3 表示，数字越小越重要：\n"
+        "   1 = 核心词（领域名、核心技术，如 ISP、FPGA）\n"
+        "   2 = 重要限定词（接口、平台、协议，如 MIPI、DVP）\n"
+        "   3 = 辅助词（场景、形容词，如 camera、embedded）\n"
+        "2) 关键词必须是英文，单词或缩写，不要用多词短语\n"
+        "3) 用一句话总结用户的核心需求\n"
+        "返回严格的 JSON，不要任何额外文字：\n"
+        "{\n"
+        '  "keywords": [\n'
+        '    {"term": "ISP", "priority": 1},\n'
+        '    {"term": "FPGA", "priority": 1},\n'
+        '    {"term": "MIPI", "priority": 2},\n'
+        '    {"term": "DVP", "priority": 2}\n'
+        "  ],\n"
+        '  "summary": "用户想要一个支持 MIPI/DVP 接口的 ISP FPGA 工程"\n'
+        "}"
     )
     user = f"用户描述：{description}"
     data = llm_json(system, user)
 
-    kws = data.get("keywords") or []
-    if not isinstance(kws, list) or not kws:
+    raw_kws = data.get("keywords") or []
+    if not isinstance(raw_kws, list) or not raw_kws:
         raise RuntimeError(f"关键词解析失败：{data}")
 
-    return {"keywords": kws, "summary": data.get("summary", "")}
+    # 兼容两种格式：字符串列表 / 对象列表
+    keywords = []
+    for item in raw_kws:
+        if isinstance(item, str):
+            keywords.append({"term": item.strip(), "priority": 2})
+        elif isinstance(item, dict) and item.get("term"):
+            keywords.append({
+                "term": str(item["term"]).strip(),
+                "priority": int(item.get("priority", 2)),
+            })
+
+    if not keywords:
+        raise RuntimeError(f"关键词解析失败：{data}")
+
+    return {"keywords": keywords, "summary": data.get("summary", "")}
 
 
 # ---------------- 步骤 2：GitHub 搜索 ----------------
-# def search_repos(keywords, language, min_stars, per_page=50) -> list[dict]:
-#     q_parts = [" ".join(keywords)]
-#     if language:
-#         q_parts.append(f"language:{language}")
-#     if min_stars:
-#         q_parts.append(f"stars:>={min_stars}")
-#     query = " ".join(q_parts)
-
-#     print(f"[search] q = {query!r}")
-
-#     r = requests.get(
-#         "https://api.github.com/search/repositories",
-#         headers=GH_HEADERS,
-#         params={"q": query, "per_page": per_page, "sort": "stars"},
-#         timeout=30,
-#     )
-#     if r.status_code == 422:
-#         print(f"[warn] 查询语法非法，回退到纯关键词", file=sys.stderr)
-#         r = requests.get(
-#             "https://api.github.com/search/repositories",
-#             headers=GH_HEADERS,
-#             params={"q": " ".join(keywords), "per_page": per_page, "sort": "stars"},
-#             timeout=30,
-#         )
-#     r.raise_for_status()
-#     return r.json().get("items", [])
-
-def search_repos(keywords, language, min_stars, per_page=50) -> list[dict]:
+def search_repos(keywords, language, min_stars, per_page=50,
+                 min_results=5) -> list[dict]:
     """
-    构造 GitHub 搜索查询并调用 API。
-    多语言用空格分隔（language:verilog language:systemverilog），
-    而不是逗号（language:verilog,systemverilog 是无效语法）。
+    先用全部关键词检索；结果不足则从最低优先级开始逐个去掉关键词，
+    用剩余的高优先级关键词重新检索，直到结果达标或只剩一个关键词。
     """
-    q_parts = [" ".join(keywords)]
+    # 按优先级升序排序：P1 在前（最重要），P3 在后（最先被去掉）
+    # Python 的 sort 是稳定排序，相同优先级的词保持原顺序
+    sorted_kws = sorted(keywords, key=lambda k: k["priority"])
+    all_terms = [k["term"] for k in sorted_kws]
+    total = len(all_terms)
 
-    # 多语言支持：按空格或逗号拆分，逐个添加 language: 限定符
+    print("=" * 60)
+    print("[search] 关键词按优先级排序：")
+    for k in sorted_kws:
+        print(f"          P{k['priority']}  {k['term']}")
+    print("=" * 60)
+
+    all_results: dict[str, dict] = {}
+    tried = set()
+
+    # 从全量开始，每次去掉最后一个（最低优先级）
+    for n in range(total, 0, -1):
+        current_terms = all_terms[:n]
+        query = _build_query(current_terms, language, min_stars)
+
+        if query in tried:
+            continue
+        tried.add(query)
+
+        round_no = total - n + 1
+        print("-" * 60)
+        print(f"[search] 第 {round_no} 轮：使用 {n} 个关键词 {current_terms}")
+        print(f"[search] 查询字符串: {query!r}")
+
+        status, items = _do_search(query, per_page)
+
+        for it in items:
+            fn = it.get("full_name")
+            if fn and fn not in all_results:
+                all_results[fn] = it
+
+        print(f"[search] 本轮返回 {len(items)} 条，"
+              f"累计去重后 {len(all_results)} 个")
+
+        # 达标，停止
+        if len(all_results) >= min_results:
+            print(f"[search] ✅ 已达到最低数量 {min_results} 个，停止放宽")
+            break
+
+        # 只剩一个关键词，仍不足，放弃继续去词
+        if n == 1:
+            print(f"[search] ⚠️ 已只剩最高优先级关键词，"
+                  f"仍不足 {min_results} 个，停止")
+            break
+
+        removed = all_terms[n - 1]
+        print(f"[search] ❌ 结果不足 {min_results} 个，"
+              f"去掉最低优先级关键词 '{removed}'，进入下一轮")
+
+        time.sleep(2)  # 遵守 GitHub 搜索 API 速率限制
+
+    return list(all_results.values())
+def _build_query(keywords, language, min_stars) -> str:
+    """把关键词列表和限定条件拼成 GitHub 搜索查询字符串。"""
+    parts = [" ".join(keywords)]
     if language:
-        langs = re.split(r"[\s,]+", language.strip())
-        for lang in langs:
+        for lang in re.split(r"[\s,]+", language.strip()):
             if lang:
-                q_parts.append(f"language:{lang}")
-
+                parts.append(f"language:{lang}")
     if min_stars:
-        q_parts.append(f"stars:>={min_stars}")
+        parts.append(f"stars:>={min_stars}")
+    return " ".join(parts)
 
-    query = " ".join(q_parts)
 
-    # ============ 日志：打印完整查询 ============
-    print("=" * 60)
-    print(f"[search] 关键词        : {keywords}")
-    print(f"[search] 语言限定      : {language!r}")
-    print(f"[search] 最低 Star     : {min_stars!r}")
-    print(f"[search] 最终查询字符串: {query!r}")
-    print(f"[search] 请求 URL      : https://api.github.com/search/repositories")
-    print(f"[search] 请求参数      : q={query!r}, per_page={per_page}, sort=stars")
-    print("=" * 60)
-    # ============================================
+def _do_search(query: str, per_page: int) -> tuple[int, list[dict]]:
+    """执行一次 GitHub 搜索，返回 (状态码, items)。"""
+    print(f"[search] 请求: q={query!r}, per_page={per_page}")
+    r = requests.get(
+        "https://api.github.com/search/repositories",
+        headers=GH_HEADERS,
+        params={"q": query, "per_page": per_page, "sort": "stars"},
+        timeout=30,
+    )
+    print(f"[search] 状态码: {r.status_code}, "
+          f"速率剩余: {r.headers.get('X-RateLimit-Remaining')}")
 
-    def _do_search(q: str) -> requests.Response:
-        return requests.get(
-            "https://api.github.com/search/repositories",
-            headers=GH_HEADERS,
-            params={"q": q, "per_page": per_page, "sort": "stars"},
-            timeout=30,
-        )
+    if r.status_code == 200:
+        data = r.json()
+        items = data.get("items", [])
+        print(f"[search] 返回: {len(items)} 条 / 总数 {data.get('total_count')}")
+        return 200, items
 
-    r = _do_search(query)
-
-    # 打印响应状态和速率限制
-    print(f"[search] 响应状态码    : {r.status_code}")
-    print(f"[search] 速率限制剩余  : {r.headers.get('X-RateLimit-Remaining')}"
-          f" / {r.headers.get('X-RateLimit-Limit')}")
-    print(f"[search] 速率重置时间  : {r.headers.get('X-RateLimit-Reset')}")
-
-    # 422：语法非法，回退到纯关键词
-    if r.status_code == 422:
-        print(f"[warn] 422 查询语法非法，响应内容: {r.text[:500]}", file=sys.stderr)
-        fallback_q = " ".join(keywords)
-        print(f"[warn] 回退查询字符串: {fallback_q!r}", file=sys.stderr)
-        r = _do_search(fallback_q)
-
-    # 403 / 429：速率限制
-    if r.status_code in (403, 429):
-        print(f"[warn] {r.status_code} 可能触发速率限制，响应内容: {r.text[:500]}",
-              file=sys.stderr)
-
-    r.raise_for_status()
-
-    data = r.json()
-    items = data.get("items", [])
-
-    # 打印结果数量和总数
-    print(f"[search] 本次返回数量  : {len(items)}")
-    print(f"[search] GitHub 报告总数: {data.get('total_count', 'N/A')}")
-    if data.get("incomplete_results"):
-        print(f"[warn] GitHub 报告结果不完整 (incomplete_results=true)", file=sys.stderr)
-
-    # 如果返回 0 条，打印前几个字段帮助排查
-    if not items:
-        print(f"[warn] 查询返回 0 条结果，请检查关键词和限定条件是否过严",
-              file=sys.stderr)
-
-    return items
+    print(f"[search] 错误: {r.text[:300]}", file=sys.stderr)
+    return r.status_code, []
 # ---------------- 步骤 3：获取 README ----------------
 def fetch_readme(full_name: str, max_chars: int = 3500) -> str:
     url = f"https://api.github.com/repos/{full_name}/readme"
@@ -309,7 +327,11 @@ def main() -> int:
     lines.append("## 🔎 语义检索结果\n")
     lines.append(f"**你的描述**：{description}\n")
     lines.append(f"**AI 理解**：{summary}\n")
-    lines.append(f"**提取关键词**：{', '.join(f'`{k}`' for k in keywords)}\n")
+    lines.append(
+    "**提取关键词**："
+    + "、".join(f"`{k['term']}`(P{k['priority']})" for k in keywords)
+    + "\n"
+)
     if language:
         lines.append(f"**语言限定**：`{language}`\n")
     if min_stars:
