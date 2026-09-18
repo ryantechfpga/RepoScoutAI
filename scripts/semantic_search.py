@@ -87,7 +87,6 @@ def llm_json(system: str, user: str):
 
 # ---------------- 步骤 1：解析描述 ----------------
 def extract_keywords(description: str) -> dict:
-def extract_keywords(description: str) -> dict:
     system = (
         "你是一个开源项目检索助手。用户会用自然语言描述他想找的开源项目。\n"
         "\n"
