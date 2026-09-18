@@ -87,25 +87,30 @@ def llm_json(system: str, user: str):
 
 # ---------------- 步骤 1：解析描述 ----------------
 def extract_keywords(description: str) -> dict:
+def extract_keywords(description: str) -> dict:
     system = (
         "你是一个开源项目检索助手。用户会用自然语言描述他想找的开源项目。\n"
-        "请完成三件事：\n"
-        "1) 提取 4-6 个英文关键词，并给每个词标注优先级\n"
-        "   优先级用 1、2、3 表示，数字越小越重要：\n"
-        "   1 = 核心词（领域名、核心技术，如 ISP、FPGA）\n"
-        "   2 = 重要限定词（接口、平台、协议，如 MIPI、DVP）\n"
-        "   3 = 辅助词（场景、形容词，如 camera、embedded）\n"
-        "2) 关键词必须是英文，单词或缩写，不要用多词短语\n"
-        "3) 用一句话总结用户的核心需求\n"
+        "\n"
+        "【核心规则】\n"
+        "1. 只提取用户描述中【明确出现】或【直接等价】的概念，"
+        "不要脑补、不要扩展、不要推断用户没说的技术栈。\n"
+        "   例如：用户说“ISP”，只提取 ISP；不要自动加 FPGA、Image Processing、"
+        "Computer Vision 等用户没提到的词。\n"
+        "2. 提取 2-4 个关键词即可，不要为了凑数而添加。\n"
+        "   如果用户描述很短，只提 1-2 个词也可以。\n"
+        "3. 每个词标注优先级：\n"
+        "   P1 = 用户描述中直接提到的核心名词\n"
+        "   P2 = 用户描述中直接提到的修饰/限定词\n"
+        "   P3 = 用户描述中直接提到的辅助词\n"
+        "4. 关键词必须是英文，单词或缩写，不要多词短语。\n"
+        "5. 用一句话总结用户需求，不要添加描述中没有的信息。\n"
+        "\n"
         "返回严格的 JSON，不要任何额外文字：\n"
         "{\n"
         '  "keywords": [\n'
-        '    {"term": "ISP", "priority": 1},\n'
-        '    {"term": "FPGA", "priority": 1},\n'
-        '    {"term": "MIPI", "priority": 2},\n'
-        '    {"term": "DVP", "priority": 2}\n'
+        '    {"term": "ISP", "priority": 1}\n'
         "  ],\n"
-        '  "summary": "用户想要一个支持 MIPI/DVP 接口的 ISP FPGA 工程"\n'
+        '  "summary": "用户想学习 ISP"\n'
         "}"
     )
     user = f"用户描述：{description}"
