@@ -1,0 +1,63 @@
+name: Semantic Repo Search
+
+on:
+  workflow_dispatch:
+    inputs:
+      description:
+        description: '用自然语言描述你想找的开源项目'
+        required: true
+        type: string
+      top_n:
+        description: '输出前 N 个项目'
+        required: false
+        default: '8'
+        type: string
+      language:
+        description: '限定语言（可选，如 python）'
+        required: false
+        default: ''
+        type: string
+      min_stars:
+        description: '最低 star 数'
+        required: false
+        default: '30'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  semantic-search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install --quiet requests
+
+      - name: Run semantic search
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          INPUT_DESCRIPTION: ${{ inputs.description }}
+          INPUT_TOP_N: ${{ inputs.top_n }}
+          INPUT_LANGUAGE: ${{ inputs.language }}
+          INPUT_MIN_STARS: ${{ inputs.min_stars }}
+          OUTPUT_DIR: results
+        run: python scripts/semantic_search.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-search-results
+          path: results/
+          if-no-files-found: warn
